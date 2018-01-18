@@ -1,0 +1,109 @@
+### Jenkins pipeline plugin
+
+
+node('swarm') {
+  properties([
+    parameters([
+      string(defaultValue: 'git@github.com:SparkHub/hyde-park.git', description: 'Git repository URL', name: 'git_url'),
+      string(defaultValue: 'b1eb3b93-cf29-4a64-a6be-b908c083824d', description: 'Jenkins credential ID of Git ssh key', name: 'git_key_id'),
+      string(defaultValue: 'development', description: 'Git branch', name: 'git_branch'),
+      string(defaultValue: 'gs-microservices-config', description: 'Microservice config bucket name', name: 's3_bucket'),
+      string(defaultValue: '6007805c-2d93-4ee8-ae8f-df9eb93284c6', description: 'KMS key ID', name: 's3_key_id'),
+      string(defaultValue: '201526351103.dkr.ecr.us-west-2.amazonaws.com', description: 'ECR repository', name: 'ecr'),
+      string(defaultValue: 'guidespark/hydepark', description: 'Docker image name', name: 'ecr_image'),
+      string(defaultValue: '1.0.1', description: 'Docker image version', name: 'image_version'),
+      string(defaultValue: 'us-west-2', description: 'AWS region', name: 'region'),
+      string(defaultValue: 'stg', description: 'Application environment name, used for Docker tag name and reading configuration from bucket: s3://$s3_bucket/$environment/', name: 'environment'),
+      string(defaultValue: 'stg', description: 'ECS cluster name', name: 'ecs_cluster'),
+      string(defaultValue: '10.154.154.107:24224', description: 'EFK host <host>:24224', name: 'efk'),
+      string(defaultValue: 'staging-hydepark-Service-54BCPY98N77P', description: 'ECS Service name', name: 'ecs_service')
+    ])
+  ])
+  
+  try{
+
+    stage('Checkout') {
+      // Get code from a GitHub repository
+      echo "git ${params.git_url}, branch: ${params.git_branch}"
+      git credentialsId: params.git_key_id, url: params.git_url, branch: params.git_branch
+    }
+
+
+    stage('Build and Push Images') {
+       // Set variables, like image names and registry
+       def app = params.ecr_image.tokenize("/")[1]
+       def app_image = "${params.ecr_image}:${params.image_version}.${env.BUILD_NUMBER}-${params.environment}-${params.git_branch}"
+       def nginx_image = "${params.ecr_image}-nginx:${params.image_version}.${env.BUILD_NUMBER}-${params.environment}-${params.git_branch}"
+       env.ecs_task_name = "${params.environment}-${app}"
+       env.app_reg = "${params.ecr}:${params.ecr_image}"
+       env.app_nginx_reg = "${params.ecr}:${params.ecr_image}-nginx"
+       env.app_image = "${params.ecr}/${app_image}"
+       env.nginx_image = "${params.ecr}/${nginx_image}"
+       env.efk = "${params.efk}"
+       env.app = "${app}"
+       env.app_registry = "${params.ecr_image}"
+       env.nginx_registry = "${params.ecr_image}-nginx"
+
+       echo "Copy Dockerfiles"
+       sh 'aws configure set s3.signature_version s3v4'
+       sh 'aws --region ${region} s3 sync s3://${s3_bucket}/${environment}/${app}/ruby/ ./ruby/ --sse-kms-key-id ${s3_key_id}'
+       sh 'aws --region ${region} s3 sync s3://${s3_bucket}/${environment}/${app}/nginx/ ./nginx/ --sse-kms-key-id ${s3_key_id}'
+       sh 'aws --region ${region} s3 cp s3://${s3_bucket}/${environment}/id_rsa ./ --sse-kms-key-id ${s3_key_id}'
+
+       echo "Login to ${params.ecr}"
+       sh "aws ecr get-login --region $region | bash"
+       echo "Build docker images in region: ${params.region}"
+       docker.withRegistry("https://${params.ecr}/") {
+          sh "cp ./ruby/Dockerfile ./"
+          def ruby = docker.build( app_image, '.')
+          ruby.push()
+          sh "cp ./nginx/Dockerfile ./"
+          def nginx = docker.build( nginx_image )
+          nginx.push()
+       }
+        
+       echo "After build key cleanup"
+       sh 'rm -f id_rsa'
+       
+    }
+
+    echo "Images created and pushed"
+
+  } catch (err) {
+
+     echo "Failed: ${err}"
+     currentBuild.result = 'FAILURE'
+
+     throw err
+  }
+    
+    stage('Deploy to ECS') {
+       sh 'aws --region $region s3 cp s3://$s3_bucket/$environment/$app/task.json ./ --sse-kms-key-id $s3_key_id'
+       sh 'sed -i "s|\\"family\\": \\"applicationfamily\\"|\\"family\\": \\"${ecs_task_name}\\"|g" ./task.json'
+       sh 'sed -i "s|\\"tag\\": \\"railstag\\"|\\"tag\\": \\"docker.rails.${ecs_task_name}\\"|g" ./task.json'
+       sh 'sed -i "s|\\"tag\\": \\"nginxtag\\"|\\"tag\\": \\"docker.nginx.${ecs_task_name}\\"|g" ./task.json'
+       sh 'sed -i "s|\\"tag\\": \\"sidekiqtag\\"|\\"tag\\": \\"docker.sidekiq.${ecs_task_name}\\"|g" ./task.json'
+       sh 'sed -i "s|\\"fluentd-address\\": \\"efk\\"|\\"fluentd-address\\": \\"${efk}\\"|g" ./task.json'
+       sh 'sed -i "s|\\"image\\": \\"applicationimage\\"|\\"image\\": \\"${app_image}\\"|g" ./task.json'
+       sh 'sed -i "s|\\"image\\": \\"nginximage\\"|\\"image\\": \\"${nginx_image}\\"|g" ./task.json'
+       String task = sh(returnStdout: true, script: 'cat ./task.json')
+       build job: 'Deploy TaskDefination', parameters: [
+        [$class: 'StringParameterValue', name: 'ecs_task_def', value: "${task}" ],
+        [$class: 'StringParameterValue', name: 'region', value: "${region}" ],
+        [$class: 'StringParameterValue', name: 'ecs_cluster', value: "${params.ecs_cluster}" ],
+        [$class: 'StringParameterValue', name: 'ecs_service', value: "${params.ecs_service}" ],
+        [$class: 'StringParameterValue', name: 'ecs_task_name', value: "${ecs_task_name}" ]
+      ]
+    }
+    
+    stage('Cleanup ECR') {
+      build job: 'Cleanup ECR', parameters: [
+        [$class: 'StringParameterValue', name: 'ecr', value: "${params.ecr_image}" ],
+        [$class: 'StringParameterValue', name: 'region', value: "${params.region}" ]
+      ]
+      build job: 'Cleanup ECR', parameters: [
+        [$class: 'StringParameterValue', name: 'ecr', value: "${params.ecr_image}-nginx" ],
+        [$class: 'StringParameterValue', name: 'region', value: "${params.region}" ]
+      ]
+    }
+}

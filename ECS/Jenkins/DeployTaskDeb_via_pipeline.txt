@@ -1,0 +1,66 @@
+### Jenkins pipeline plugin
+
+
+node {
+  properties([
+    parameters([
+      string(defaultValue: 'stg', description: 'ECS cluster name', name: 'ecs_cluster'),
+      string(defaultValue: 'us-west-2', description: 'AWS region', name: 'region'),
+      string(defaultValue: 'staging-hydepark-Service-54BCPY98N77P', description: 'ECS Service name', name: 'ecs_service'),
+      string(defaultValue: 'stg-hydepark', description: 'ECS Task Defination', name: 'ecs_task_name'),
+      string(defaultValue: '', description: 'ECS task defination', name: 'ecs_task_def')
+    ])
+  ])
+  
+  stage('Deploy to ESC') {
+    if ( "${params.ecs_task}" == "" ) {
+      echo "Task defination not present"
+      //currentBuild.result = 'FAILURE'
+      //sh "exit 1"
+    }
+
+    sh '''#!/bin/bash
+    echo "Create new revision for task defination $ecs_task_name for service $ecs_service"
+    echo ${ecs_task_def} > ./task.json
+    CUR_TASKDEF=`aws --region $region ecs describe-services --services $ecs_service --cluster $ecs_cluster | grep "taskDefinition" | head -1 | awk -F'"' '{print $4}'`
+    echo "Current revision: $CUR_TASKDEF"
+    echo "execute aws --region $region ecs register-task-definition --cli-input-json file://./task.json"
+    NEW_TASKDEF=`aws --region $region ecs register-task-definition --cli-input-json file://./task.json | grep "taskDefinitionArn" | head -1 | awk -F'"' '{print $4}'`
+    if [ "x$NEW_TASKDEF" = "x" ]
+    then
+      echo "Task defination create fails"
+      exit 2
+    fi
+    echo "New revision: $NEW_TASKDEF"
+    echo "Update service $ecs_service with new $ecs_task_name revision"
+    echo "aws --region $region ecs update-service --cluster $ecs_cluster --service $ecs_service --task-definition $NEW_TASKDEF"
+    SERVICE_UPDATE=`aws --region $region ecs update-service --cluster $ecs_cluster --service $ecs_service --task-definition $NEW_TASKDEF > /dev/null; echo $?`
+    if [ "x$SERVICE_UPDATE" != "x0" ]
+    then
+       echo "Service update failed"
+       exit $SERVICE_UPDATE
+    fi
+    echo "Wait service stable status...."
+    STATUS=`aws --region $region ecs wait services-stable --cluster $ecs_cluster --services $ecs_service; echo $?`
+    if [ "x$STATUS" != "x0" ]
+    then
+      echo "Task defination revision fail to start, rollback..."
+      echo "aws --region $region ecs update-service --cluster $ecs_cluster --service $ecs_service --task-definition $CUR_TASKDEF"
+      SERVICE_ROLLBACK_UPDATE=`aws --region $region ecs update-service --cluster $ecs_cluster --service $ecs_service --task-definition $CUR_TASKDEF > /dev/null; echo $?`
+      if [ "x$SERVICE_ROLLBACK_UPDATE" != "x0" ]
+      then
+         echo "Service rollback failed"
+         exit $SERVICE_ROLLBACK_UPDATE
+      fi
+      ROLLBACK=`aws --region $region ecs wait services-stable --cluster $ecs_cluster --services $ecs_service; echo $?`
+      if [ "x$ROLLBACK" != "x0" ]
+      then
+        echo "Rollback failed, need manual investigation."
+      else
+        echo "Rollback succeeded"
+      fi
+      exit $STATUS
+    fi
+    '''
+    }
+}

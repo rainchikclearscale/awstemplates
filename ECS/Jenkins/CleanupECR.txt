@@ -1,0 +1,30 @@
+### Jenkins pipeline plugin
+
+
+node {
+  properties([
+    parameters([
+      string(defaultValue: '', description: 'ECR repository name', name: 'ecr'),
+      string(defaultValue: '7', description: 'How many images to leave', name: 'leave'),
+      string(defaultValue: 'us-west-2', description: 'AWS region', name: 'region')
+    ])
+  ])
+  
+  stage('Cleanup ECR') {
+    if ( "${params.ecr}" == "" ) {
+      echo "Repository not defined"
+    } else {
+      env.ecr = params.ecr
+      env.leave = params.leave
+      env.region = params.region
+      sh '''#!/bin/bash
+      IMAGES=`aws --region $region ecr describe-images --repository-name $ecr --max-items 100 --output text | awk '$1 == "IMAGEDETAILS" {print int($3)" "$2}'  | sort -r -n -k 1 | tail -n +$((leave+1)) | awk '{print $2}'`
+      echo "Clean $ecr in region $region with leave $leave images"
+      for d in $IMAGES
+      do
+        aws --region $region ecr batch-delete-image --repository-name $ecr --image-ids imageDigest=$d
+      done
+      '''
+    }
+  }
+}
